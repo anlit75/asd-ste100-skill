@@ -22,6 +22,10 @@ import sys
 # ponytail: regex heuristics, not a parser. No noun-cluster rule — needs POS
 # tagging to avoid constant false positives; add spaCy-backed rule if ever needed.
 # No ellipsis rule by owner's choice: technical writing sometimes earns one.
+# Irregular past participles that carry no -ed/-en ending. Shared by the passive-voice
+# and present-perfect rules so "has run" is caught the same way "is run" is.
+IRREGULAR_PARTICIPLES = "given|taken|made|done|found|seen|known|shown|written|built|sent|set|run|read|kept|held|left|put|cut|hit|let|shut|split|spread|begun|become|come|gone|got|gotten|lost|met|paid|said|sold|told|thought|brought|bought|caught|taught|won|worn|torn|born|drawn|grown|thrown|flown|driven|risen|chosen|broken|spoken|frozen|hidden|ridden|forgotten|fallen|eaten|beaten|understood|stood|struck|stuck|swung|hung|led|fed|bled|fled|sped|bound|wound|dug|spun|slid|bit|lit|quit"
+
 RULES = [
     ("semicolon", "advisory-free",
      re.compile(r";"),
@@ -36,11 +40,11 @@ RULES = [
      re.compile(r"\b(perform|performs|performed|conduct|conducts|conducted|carry out|carries out|carried out)\s+(?:a|an|the)\s+\w+(?:tion|sion|ment|ance|ence|ysis)\b", re.I),
      "Action frozen into a noun. Use the verb (analyze, not perform an analysis of)."),
     ("passive-voice", "advisory",
-     re.compile(r"\b(is|are|was|were|been|being)\s+(\w+ed|given|taken|made|done|found|seen|known|shown|written|built|sent|set|run|read|kept|held|left|put)\b(?!\s+(?:to|for|by)\s+\w+ing)", re.I),
+     re.compile(r"\b(is|are|was|were|been|being)\s+(\w+ed|" + IRREGULAR_PARTICIPLES + r")\b(?!\s+(?:to|for|by)\s+\w+ing)", re.I),
      "Possible passive voice. Name the actor and use an active verb, unless the actor is unknown or irrelevant."),
     ("present-perfect", "advisory",
      # modal + perfect infinitive ("may have failed") is a protected hedge, not present perfect
-     re.compile(r"(?<!\bmay )(?<!\bmight )(?<!\bcould )(?<!\bshould )(?<!\bwould )(?<!\bmust )\b(has|have|had)\s+(?:been\s+)?\w+(?:ed|en)\b", re.I),
+     re.compile(r"(?<!\bmay )(?<!\bmight )(?<!\bcould )(?<!\bshould )(?<!\bwould )(?<!\bmust )\b(has|have|had)\s+(?:been\s+)?(?:\w+(?:ed|en)|" + IRREGULAR_PARTICIPLES + r")\b", re.I),
      "Compound tense. Use simple past/present unless current relevance is the point (then keep and flag)."),
 ]
 
@@ -312,6 +316,11 @@ def selftest():
     findings, _ = lint("The request may have failed. It could be a timeout. "
                        "The disk might have filled.")
     assert findings == [], findings
+    # irregular participles: "has run" is a compound tense as much as "has failed"
+    findings, _ = lint("The task has run. The job has set the flag. We have begun.")
+    assert sum(1 for f in findings if f["rule"] == "present-perfect") == 3, findings
+    findings, _ = lint("The job may have run.")
+    assert not any(f["rule"] == "present-perfect" for f in findings), findings
     # code blocks skipped
     findings, _ = lint("```\nx = a; y = b\n```")
     assert findings == []
