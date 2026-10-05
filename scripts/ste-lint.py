@@ -14,7 +14,11 @@ Usage:
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
 Advisory findings (passive voice, compound tenses) never fail the run.
+Exit 2 on a usage error (unknown flag, bad value, unknown rule, unreadable file).
 """
+import argparse
+import contextlib
+import io
 import json
 import re
 import sys
@@ -79,10 +83,72 @@ LIST_ITEM_START = re.compile(
 )
 CONJUNCTION_END = re.compile(r"\b(?:and|or)\s*$", re.I)
 TABLE_SEPARATOR_CELL = re.compile(r"^:?-{3,}:?$")
+# Headings, thematic breaks, and front-matter delimiters stand alone.
+STANDALONE_LINE = re.compile(r"^ {0,3}(?:#|(?:[-*_=] *){3,}$)")
+BLOCKQUOTE = re.compile(r"^ {0,3}>")
+# Terminal punctuation, optionally followed by closing quotes or brackets.
+SENTENCE_END = re.compile(r"[.!?][\"'”’)\]]*(?=\s|$)")
+# Abbreviations whose period does not end a sentence. Dotted initialisms
+# such as "e.g." and "U.S." are matched by DOTTED_ABBREVIATION instead.
+ABBREVIATIONS = {"vs.", "cf.", "approx.", "mr.", "mrs.", "ms.", "dr.", "fig.", "no."}
+DOTTED_ABBREVIATION = re.compile(r"(?:[a-z]\.){2,}", re.I)
 
 
 def _word_re(base):
     return re.compile(r"\b" + base + r"(?:s|es|ed|d|ing)?\b", re.I)
+
+
+def _mask_inline_code(text):
+    """Blank code spans with equal-length spaces so columns stay true."""
+    return INLINE_CODE.sub(lambda match: " " * len(match.group(0)), text)
+
+
+def _sentence_starts(text):
+    """Return the offset of each sentence start in text.
+
+    A sentence ends at terminal punctuation, after any closing quotes or
+    brackets, when whitespace or the end of text follows. Known
+    abbreviations do not end a sentence.
+    """
+    starts = [len(text) - len(text.lstrip())]
+    for m in SENTENCE_END.finditer(text):
+        token = text[:m.start() + 1].split()[-1].lstrip("\"'“‘([")
+        if token.lower() in ABBREVIATIONS or DOTTED_ABBREVIATION.fullmatch(token):
+            continue
+        rest = text[m.end():]
+        if rest.strip():
+            starts.append(m.end() + len(rest) - len(rest.lstrip()))
+    return starts
+
+
+def _long_sentence_findings(pieces, filename):
+    """Flag long sentences in one prose block.
+
+    pieces is a list of (lineno, source_column, text) tuples. The texts are
+    joined with spaces, so a sentence wrapped across source lines is counted
+    once, and each finding points at the line and column where it starts.
+    """
+    joined, offsets = "", []
+    for lineno, source_column, text in pieces:
+        if joined:
+            joined += " "
+        offsets.append((len(joined), lineno, source_column))
+        joined += text
+    findings = []
+    starts = _sentence_starts(joined)
+    for start, end in zip(starts, starts[1:] + [len(joined)]):
+        n = len(joined[start:end].split())
+        if n <= MAX_WORDS:
+            continue
+        offset, lineno, source_column = next(
+            o for o in reversed(offsets) if o[0] <= start
+        )
+        findings.append({"file": filename, "line": lineno,
+                         "col": source_column + start - offset + 1,
+                         "rule": "long-sentence", "level": "advisory-free",
+                         "match": f"{n} words",
+                         "message": f"Sentence has {n} words (cap {MAX_WORDS}). Split it."})
+    return findings
 
 
 def _leading_spaces(line):
@@ -246,15 +312,30 @@ def lint(text, filename="<stdin>"):
     table_cells = _markdown_table_cells(lines)
     # first occurrence of each synonym-group member: (group_idx, base) -> (line, col, match)
     seen_synonyms = {}
+    # consecutive prose lines form one block, so wrapped sentences count once
+    block = []
+    in_quote = False
+
+    def flush():
+        findings.extend(_long_sentence_findings(block, filename))
+        block.clear()
+
     for lineno, raw_line in enumerate(lines, 1):
         if CODE_FENCE.match(raw_line.strip()):
+            flush()
             in_fence = not in_fence
             continue
         if in_fence:
             continue
         segments = table_cells.get(lineno - 1, [(raw_line, 0)])
+        is_table = (lineno - 1) in table_cells
+        is_quote = bool(BLOCKQUOTE.match(raw_line))
+        if (is_table or not raw_line.strip() or STANDALONE_LINE.match(raw_line)
+                or LIST_ITEM_START.match(raw_line) or is_quote != in_quote):
+            flush()
+        in_quote = is_quote
         for segment, source_column in segments:
-            line = INLINE_CODE.sub("", segment)
+            line = _mask_inline_code(segment)
             words_total += len(line.split())
             for rule_id, level, pattern, msg in RULES:
                 for m in pattern.finditer(line):
@@ -275,14 +356,13 @@ def lint(text, filename="<stdin>"):
                         seen_synonyms[(gi, base)] = (
                             lineno, source_column + m.start() + 1, m.group(0)
                         )
-            for sent in re.split(r"(?<=[.!?])\s+", line):
-                n = len(sent.split())
-                if n > MAX_WORDS:
-                    findings.append({"file": filename, "line": lineno,
-                                     "col": source_column + 1,
-                                     "rule": "long-sentence", "level": "advisory-free",
-                                     "match": f"{n} words",
-                                     "message": f"Sentence has {n} words (cap {MAX_WORDS}). Split it."})
+            if line.strip():
+                block.append((lineno, source_column, line))
+            if is_table:
+                flush()  # each table cell is its own block
+        if STANDALONE_LINE.match(raw_line):
+            flush()
+    flush()
     # synonym rotation: flag each member after the first, at its first occurrence
     for gi, group in enumerate(SYNONYM_GROUPS):
         present = [(seen_synonyms[(gi, b)], b) for b in group if (gi, b) in seen_synonyms]
@@ -443,34 +523,95 @@ def selftest():
     # per-file labels
     findings, _ = lint("a; b", filename="x.md")
     assert findings[0]["file"] == "x.md"
+    # inline code is masked, not deleted, so columns match the source
+    findings, _ = lint("Run `make all` then spin up the node.")
+    phrasal = [f for f in findings if f["rule"] == "phrasal-verb"]
+    assert len(phrasal) == 1 and phrasal[0]["col"] == 21, phrasal
+    # a sentence ends after closing quotes and brackets
+    twenty = " ".join(["word"] * 20)
+    findings, _ = lint(f'He asked "{twenty}?" Then {twenty} ended. (It {twenty}.) Next.')
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    # abbreviations do not end a sentence
+    findings, _ = lint(f"Use a tool, e.g. the {twenty} linter here now.")
+    assert any(f["rule"] == "long-sentence" for f in findings), findings
+    findings, _ = lint(f"Compare A vs. B in the {twenty} test.")
+    assert any(f["rule"] == "long-sentence" for f in findings), findings
+    # a sentence wrapped across lines is counted once, at its start
+    findings, _ = lint(f"Intro text here.\nThe {twenty}\nwrapped tail words go here.")
+    long_sentences = [f for f in findings if f["rule"] == "long-sentence"]
+    assert len(long_sentences) == 1, long_sentences
+    assert (long_sentences[0]["line"], long_sentences[0]["col"]) == (2, 1), long_sentences
+    findings, _ = lint(f"- Item {twenty}\n  continued in the same item.")
+    assert any(f["rule"] == "long-sentence" for f in findings), findings
+    # blank lines, headings, rules, list items, and quotes end a prose block
+    for sep in ("\n\n", "\n# Heading\n", "\n---\n", "\n- ", "\n> "):
+        findings, _ = lint(f"First {twenty} line{sep}Second {twenty} line.")
+        assert not any(f["rule"] == "long-sentence" for f in findings), (sep, findings)
+    # command-line parsing rejects typos and bad values
+    for bad in (["--basline", "3"], ["--baseline"], ["--baseline", "x"],
+                ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(bad)
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+        else:
+            raise AssertionError(bad)
+    assert _rule_list("passive-voice,present-perfect") == {"passive-voice", "present-perfect"}
     print("selftest OK")
 
 
+RULE_IDS = {rule_id for rule_id, *_ in RULES} | {
+    "long-sentence", "synonym-rotation", "dangling-conjunction"}
+
+
+def _rule_list(value):
+    rules = {r for r in value.split(",") if r}
+    unknown = rules - RULE_IDS
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown rule(s): {', '.join(sorted(unknown))}. "
+            f"Known rules: {', '.join(sorted(RULE_IDS))}")
+    return rules
+
+
+def _non_negative_int(value):
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return n
+
+
 def main(argv):
-    if "--selftest" in argv:
+    parser = argparse.ArgumentParser(
+        prog="ste-lint.py", allow_abbrev=False,
+        description="Deterministic linter for the structural STE rules. "
+                    "Reads stdin when no FILE is given.")
+    parser.add_argument("paths", nargs="*", metavar="FILE")
+    parser.add_argument("--json", action="store_true", help="print findings as JSON")
+    parser.add_argument("--baseline", type=_non_negative_int, default=0, metavar="N",
+                        help="pass unless hard violations exceed N (default 0)")
+    parser.add_argument("--disable", type=_rule_list, default=set(), metavar="RULES",
+                        help="comma-separated rule IDs to silence")
+    parser.add_argument("--selftest", action="store_true", help="run the built-in tests")
+    args = parser.parse_args(argv)
+    if args.selftest:
         selftest()
         return 0
-    as_json = "--json" in argv
-    baseline = 0
-    disabled = set()
-    paths = []
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--baseline":
-            i += 1
-            baseline = int(argv[i])
-        elif a == "--disable":
-            i += 1
-            disabled = set(argv[i].split(","))
-        elif not a.startswith("--"):
-            paths.append(a)
-        i += 1
+    as_json, baseline, disabled, paths = args.json, args.baseline, args.disable, args.paths
 
     findings, words_total = [], 0
     if paths:
         for p in paths:
-            f, w = lint(open(p, encoding="utf-8").read(), filename=p)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as e:
+                parser.error(f"cannot read {p}: {e.strerror}")
+            f, w = lint(text, filename=p)
             findings.extend(f)
             words_total += w
     else:
