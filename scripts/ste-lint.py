@@ -92,9 +92,9 @@ BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}(?:> ?)+")
 # Any list marker at any depth starts a new prose block.
 ANY_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)])(?:\s|$)")
 # A token that ends in terminal punctuation, optionally followed by closing
-# quotes or brackets.
-SENTENCE_END = re.compile(r"[.!?][\"'”’)\]]*$")
-OPENERS = "\"'“‘(["
+# quotes, brackets, or Markdown emphasis markers ("**Lead.**").
+SENTENCE_END = re.compile(r"[.!?][\"'”’)\]*_]*$")
+OPENERS = "\"'“‘([*_"
 # Abbreviations whose period never ends a sentence.
 ABBREVIATIONS = {"vs.", "cf.", "approx.", "mr.", "mrs.", "ms.", "dr.", "fig.", "no."}
 # Dotted initialisms such as "e.g." and "U.S." end a sentence only when the
@@ -567,6 +567,13 @@ def selftest():
     for sep in ("\n\n", "\n# Heading\n", "\n---\n", "\n- ", "\n> "):
         findings, _ = lint(f"First {twenty} line{sep}Second {twenty} line.")
         assert not any(f["rule"] == "long-sentence" for f in findings), (sep, findings)
+    # a bold or italic lead sentence ends at its closing emphasis marker
+    findings, _ = lint(f"**Lead.** The {twenty} more words here now.")
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    findings, _ = lint(f"_Note._ The {twenty} more words here now.")
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    findings, _ = lint(f"See **e.g.** the {twenty} linter here now.")
+    assert any(f["rule"] == "long-sentence" for f in findings), findings
     # a dotted abbreviation ends a sentence before a capitalized word
     findings, _ = lint(f"The team shipped it in the U.S. Then {twenty} today.")
     assert not any(f["rule"] == "long-sentence" for f in findings), findings
