@@ -17,11 +17,14 @@ Advisory findings (passive voice, compound tenses) never fail the run.
 Exit 2 on a usage error (unknown flag, bad value, unknown rule, unreadable file).
 """
 import argparse
+import bisect
 import contextlib
 import io
 import json
+import os
 import re
 import sys
+import tempfile
 
 # ponytail: regex heuristics, not a parser. No noun-cluster rule — needs POS
 # tagging to avoid constant false positives; add spaCy-backed rule if ever needed.
@@ -83,14 +86,19 @@ LIST_ITEM_START = re.compile(
 )
 CONJUNCTION_END = re.compile(r"\b(?:and|or)\s*$", re.I)
 TABLE_SEPARATOR_CELL = re.compile(r"^:?-{3,}:?$")
-# Headings, thematic breaks, and front-matter delimiters stand alone.
-STANDALONE_LINE = re.compile(r"^ {0,3}(?:#|(?:[-*_=] *){3,}$)")
-BLOCKQUOTE = re.compile(r"^ {0,3}>")
-# Terminal punctuation, optionally followed by closing quotes or brackets.
-SENTENCE_END = re.compile(r"[.!?][\"'”’)\]]*(?=\s|$)")
-# Abbreviations whose period does not end a sentence. Dotted initialisms
-# such as "e.g." and "U.S." are matched by DOTTED_ABBREVIATION instead.
+# Headings, thematic breaks, front-matter delimiters, and HTML lines stand alone.
+STANDALONE_LINE = re.compile(r"^ {0,3}(?:#|<|(?:[-*_=] *){3,}$)")
+BLOCKQUOTE_PREFIX = re.compile(r"^ {0,3}(?:> ?)+")
+# Any list marker at any depth starts a new prose block.
+ANY_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)])(?:\s|$)")
+# A token that ends in terminal punctuation, optionally followed by closing
+# quotes or brackets.
+SENTENCE_END = re.compile(r"[.!?][\"'”’)\]]*$")
+OPENERS = "\"'“‘(["
+# Abbreviations whose period never ends a sentence.
 ABBREVIATIONS = {"vs.", "cf.", "approx.", "mr.", "mrs.", "ms.", "dr.", "fig.", "no."}
+# Dotted initialisms such as "e.g." and "U.S." end a sentence only when the
+# next word starts with a capital letter.
 DOTTED_ABBREVIATION = re.compile(r"(?:[a-z]\.){2,}", re.I)
 
 
@@ -106,18 +114,25 @@ def _mask_inline_code(text):
 def _sentence_starts(text):
     """Return the offset of each sentence start in text.
 
-    A sentence ends at terminal punctuation, after any closing quotes or
-    brackets, when whitespace or the end of text follows. Known
-    abbreviations do not end a sentence.
+    A sentence ends at a word that ends in terminal punctuation, after any
+    closing quotes or brackets. Known abbreviations do not end a sentence.
+    One pass over the words keeps the cost linear in the text length.
     """
-    starts = [len(text) - len(text.lstrip())]
-    for m in SENTENCE_END.finditer(text):
-        token = text[:m.start() + 1].split()[-1].lstrip("\"'“‘([")
-        if token.lower() in ABBREVIATIONS or DOTTED_ABBREVIATION.fullmatch(token):
+    words = list(re.finditer(r"\S+", text))
+    if not words:
+        return [0]
+    starts = [words[0].start()]
+    for word, next_word in zip(words, words[1:]):
+        end = SENTENCE_END.search(word.group())
+        if not end:
             continue
-        rest = text[m.end():]
-        if rest.strip():
-            starts.append(m.end() + len(rest) - len(rest.lstrip()))
+        core = word.group()[:end.start() + 1].lstrip(OPENERS)
+        if core.lower() in ABBREVIATIONS:
+            continue
+        if (DOTTED_ABBREVIATION.fullmatch(core)
+                and not next_word.group().lstrip(OPENERS)[:1].isupper()):
+            continue
+        starts.append(next_word.start())
     return starts
 
 
@@ -128,21 +143,20 @@ def _long_sentence_findings(pieces, filename):
     joined with spaces, so a sentence wrapped across source lines is counted
     once, and each finding points at the line and column where it starts.
     """
-    joined, offsets = "", []
-    for lineno, source_column, text in pieces:
-        if joined:
-            joined += " "
-        offsets.append((len(joined), lineno, source_column))
-        joined += text
+    offsets, position = [], 0
+    for _, _, text in pieces:
+        offsets.append(position)
+        position += len(text) + 1
+    joined = " ".join(text for _, _, text in pieces)
     findings = []
     starts = _sentence_starts(joined)
     for start, end in zip(starts, starts[1:] + [len(joined)]):
         n = len(joined[start:end].split())
         if n <= MAX_WORDS:
             continue
-        offset, lineno, source_column = next(
-            o for o in reversed(offsets) if o[0] <= start
-        )
+        index = bisect.bisect_right(offsets, start) - 1
+        offset = offsets[index]
+        lineno, source_column, _ = pieces[index]
         findings.append({"file": filename, "line": lineno,
                          "col": source_column + start - offset + 1,
                          "rule": "long-sentence", "level": "advisory-free",
@@ -329,9 +343,13 @@ def lint(text, filename="<stdin>"):
             continue
         segments = table_cells.get(lineno - 1, [(raw_line, 0)])
         is_table = (lineno - 1) in table_cells
-        is_quote = bool(BLOCKQUOTE.match(raw_line))
-        if (is_table or not raw_line.strip() or STANDALONE_LINE.match(raw_line)
-                or LIST_ITEM_START.match(raw_line) or is_quote != in_quote):
+        quote = BLOCKQUOTE_PREFIX.match(raw_line)
+        is_quote = bool(quote)
+        # judge block boundaries on the text inside any blockquote prefix
+        content = raw_line[quote.end():] if quote else raw_line
+        standalone = STANDALONE_LINE.match(content)
+        if (is_table or not content.strip() or standalone
+                or ANY_LIST_ITEM.match(content) or is_quote != in_quote):
             flush()
         in_quote = is_quote
         for segment, source_column in segments:
@@ -356,11 +374,13 @@ def lint(text, filename="<stdin>"):
                         seen_synonyms[(gi, base)] = (
                             lineno, source_column + m.start() + 1, m.group(0)
                         )
-            if line.strip():
-                block.append((lineno, source_column, line))
+            # the blockquote prefix is markup, not words in the sentence
+            skip = quote.end() if quote and not is_table else 0
+            if line[skip:].strip():
+                block.append((lineno, source_column + skip, line[skip:]))
             if is_table:
                 flush()  # each table cell is its own block
-        if STANDALONE_LINE.match(raw_line):
+        if standalone:
             flush()
     flush()
     # synonym rotation: flag each member after the first, at its first occurrence
@@ -547,6 +567,32 @@ def selftest():
     for sep in ("\n\n", "\n# Heading\n", "\n---\n", "\n- ", "\n> "):
         findings, _ = lint(f"First {twenty} line{sep}Second {twenty} line.")
         assert not any(f["rule"] == "long-sentence" for f in findings), (sep, findings)
+    # a dotted abbreviation ends a sentence before a capitalized word
+    findings, _ = lint(f"The team shipped it in the U.S. Then {twenty} today.")
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    # nested list items, quoted list items, and HTML lines end a prose block
+    for text in (f"- First item\n    - First {twenty} line\n      - Second {twenty} line",
+                 f"> - First {twenty} line\n> - Second {twenty} line",
+                 f"<!-- First {twenty} line -->\nSecond {twenty} line.",
+                 f"> First {twenty} line.\n>\n> Second {twenty} line."):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "long-sentence" for f in findings), (text, findings)
+    # a blockquote prefix is not a word in a wrapped quoted sentence
+    findings, _ = lint("> " + "\n> ".join(["word word word word word"] * 5) + ".")
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    # a long block stays linear: one short sentence per line, no blank lines
+    findings, _ = lint("The agent read the log.\n" * 20000)
+    assert not any(f["rule"] == "long-sentence" for f in findings)
+    # flags may appear between file paths
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = [os.path.join(tmp, name) for name in ("a.md", "b.md")]
+        for path in paths:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Short line here.\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main([paths[0], "--json", paths[1]]) == 0
+        assert json.loads(out.getvalue())["words"] == 6, out.getvalue()
     # command-line parsing rejects typos and bad values
     for bad in (["--basline", "3"], ["--baseline"], ["--baseline", "x"],
                 ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"]):
@@ -597,7 +643,8 @@ def main(argv):
     parser.add_argument("--disable", type=_rule_list, default=set(), metavar="RULES",
                         help="comma-separated rule IDs to silence")
     parser.add_argument("--selftest", action="store_true", help="run the built-in tests")
-    args = parser.parse_args(argv)
+    # intermixed parsing keeps flags valid between file paths
+    args = parser.parse_intermixed_args(argv)
     if args.selftest:
         selftest()
         return 0
